@@ -1,0 +1,42 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "pool-explorer"
+main = "workers/src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Static assets: the frontend is pure static files, served by the asset
+# pipeline. Build the stylesheet before deploying:
+#   npx @tailwindcss/cli -i src/input.css -o tailwind.css
+[assets]
+directory = "."
+binding = "ASSETS"
+not_found_handling = "404-page"
+
+# The read API is public on-chain state.
+[observability]
+enabled = true
+
+# Cron Trigger — one indexing pass.
+#
+# Cloudflare's minimum cron granularity is 1 minute, so this is the fastest
+# ingest cadence available here. Expect up to 60s of latency between a pool
+# being created on-chain and appearing in the UI, versus 3s on the
+# self-hosted server.
+#
+# Cron-triggered invocations are capped at 15 min wall-clock / 30s CPU, so
+# TUNING.maxBlocksPerRun bounds how much history a cold start backfills.
+[triggers]
+crons = ["* * * * *"]
+
+# D1 binding. Create with:
+#   npx wrangler d1 create pool-explorer
+# then paste the returned database_id here and uncomment.
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "pool-explorer"
+# database_id = "<your-database-id>"
+
+# Free-tier notes: 10ms CPU per request and 50 D1 queries per invocation.
+# The indexer is written to stay inside the query budget by batching every
+# lookup, but the 1-minute cron itself is billed as requests on Free.
+# Workers Paid ($5/mo) removes both caps and is what production should use.

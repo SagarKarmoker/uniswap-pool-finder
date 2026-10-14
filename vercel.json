@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npx @tailwindcss/cli -i src/input.css -o tailwind.css",
+  "functions": {
+    "api/stream.js": {
+      "maxDuration": 300
+    },
+    "api/cron.js": {
+      "maxDuration": 300
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "* * * * *"
+    }
+  ]
+}

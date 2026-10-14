@@ -1,18 +1,31 @@
 {
-  "name": "sme-financial-copilot",
+  "name": "uniswap-pool-finder",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
+  "description": "Real-time explorer for newly listed Uniswap V3/V4 pools on Base and Robinhood Chain",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
     "dev": "node scripts/dev.js",
     "api": "node server.js",
     "start": "node server.js",
     "build": "vite build",
-    "preview": "vite preview --port 5173"
+    "preview": "vite preview --port 5173",
+    "test": "node --test \"test/*.test.js\"",
+    "smoke": "node scripts/smoke.js",
+    "tailwind": "tailwindcss -i src/input.css -o tailwind.css",
+    "deploy:cloudflare": "npm run tailwind && wrangler deploy",
+    "deploy:vercel": "npm run tailwind && vercel --prod"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
     "tailwindcss": "^4.3.3",
     "vite": "^6.0.0"
+  },
+  "optionalDependencies": {
+    "@vercel/postgres": "^0.10.0"
   }
 }
