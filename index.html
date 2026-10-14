@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Uniswap V3 & V4 Pool Explorer</title>
+<link rel="stylesheet" href="/tailwind.css">
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { font-family: "Inter", system-ui, sans-serif; background: #0b1220; }
+  .display { font-family: "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+  .card { background: #111827; border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 4px; }
+</style>
+</head>
+<body class="text-slate-100 antialiased min-h-screen">
+<header class="sticky top-0 z-50 backdrop-blur border-b border-white/5" style="background:rgba(11,18,32,0.8)">
+  <div class="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-2 font-semibold display text-lg">
+      <span class="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 to-blue-600 grid place-items-center text-white font-bold">U</span>
+      <span>Pool Explorer</span>
+      <span class="hidden sm:inline text-xs px-2 py-0.5 rounded-full bg-white/5 text-slate-400 font-normal">Uniswap V3 & V4 · Base & Robinhood</span>
+    </div>
+    <div class="text-xs text-slate-500" id="rpcStatus">—</div>
+  </div>
+</header>
+
+<main class="max-w-[1400px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+  <section class="relative overflow-hidden card p-6">
+    <div class="absolute inset-0 bg-gradient-to-br from-cyan-500/10 via-transparent to-violet-500/10 pointer-events-none"></div>
+    <div class="relative flex flex-col md:flex-row md:items-center justify-between gap-5">
+      <div>
+        <h1 class="display text-3xl font-bold bg-gradient-to-r from-cyan-300 via-white to-violet-300 bg-clip-text text-transparent">Latest listed Uniswap pools</h1>
+        <div class="flex items-center gap-2 mt-2 text-xs text-slate-400">
+          <span class="relative flex h-2 w-2">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
+          </span>
+          Live on Base & Robinhood mainnets · realtime SQLite-backed stream
+        </div>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <div class="rounded-xl border border-white/10 bg-white/5 px-3 py-2 backdrop-blur">
+          <label class="text-[10px] uppercase tracking-widest text-slate-500 block mb-1">Chain</label>
+          <select id="chainSelect" class="bg-transparent text-sm outline-none cursor-pointer text-slate-100">
+            <option value="all" selected>All chains</option>
+            <option value="base">Base</option>
+            <option value="robinhood">Robinhood</option>
+          </select>
+        </div>
+        <div class="rounded-xl border border-white/10 bg-white/5 px-3 py-2 backdrop-blur">
+          <label class="text-[10px] uppercase tracking-widest text-slate-500 block mb-1">Protocol</label>
+          <select id="protocolSelect" class="bg-transparent text-sm outline-none cursor-pointer text-slate-100">
+            <option value="v3">V3 only</option>
+            <option value="v4">V4 only</option>
+            <option value="both" selected="">V3 + V4</option>
+          </select>
+        </div>
+        <button id="loadBtn" class="bg-cyan-500 hover:bg-cyan-400 active:scale-95 transition text-slate-900 font-semibold px-5 py-3 rounded-xl text-sm shadow-lg shadow-cyan-500/20">Refresh</button>
+      </div>
+    </div>
+    <div class="relative mt-5">
+      <div class="h-2 bg-white/5 rounded-full overflow-hidden">
+        <div id="progressBar" class="h-full bg-gradient-to-r from-cyan-400 to-violet-400 transition-all" style="width:0%"></div>
+      </div>
+      <p id="progressText" class="text-xs text-slate-500 mt-2">Connecting…</p>
+    </div>
+    <div class="relative grid grid-cols-2 md:grid-cols-5 gap-3 mt-5">
+      <div class="card p-3 bg-slate-900/60"><p class="text-[10px] uppercase tracking-wide text-slate-500">Latest block</p><p id="statBlock" class="display text-lg font-bold">—</p></div>
+      <div class="card p-3 bg-slate-900/60"><p class="text-[10px] uppercase tracking-wide text-slate-500">Pools found</p><p id="statPools" class="display text-lg font-bold">—</p></div>
+      <div class="card p-3 bg-slate-900/60"><p class="text-[10px] uppercase tracking-wide text-slate-500">Unique tokens</p><p id="statTokens" class="display text-lg font-bold">—</p></div>
+      <div class="card p-3 bg-slate-900/60"><p class="text-[10px] uppercase tracking-wide text-slate-500">Blocks scanned</p><p id="statScanned" class="display text-lg font-bold">—</p></div>
+      <div class="card p-3 bg-slate-900/60"><p class="text-[10px] uppercase tracking-wide text-slate-500">Updated</p><p id="statTime" class="display text-lg font-bold">—</p></div>
+    </div>
+  </section>
+  <section id="pagination" class="flex items-center justify-between gap-3 text-sm"></section>
+  <section id="results" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"></section>
+</main>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
