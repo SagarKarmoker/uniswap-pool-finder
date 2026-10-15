@@ -13,6 +13,22 @@ const INIT_EVENT_V4 = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e611
 const RESERVES_LENS = "0x0000001b173C3bbF3984D417d8614E3eed34865B";
 const POOL_EVENT = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118";
 
+// Retention policy. Pools are ephemeral discovery data: a row may never live
+// longer than RETENTION_MS after it was created.
+const RETENTION_MS = Number(process.env.RETENTION_MS || 30 * 60 * 1000);
+const PRUNE_INTERVAL_MS = Number(process.env.PRUNE_INTERVAL_MS || 30 * 1000);
+
+// Indexing cadence. `MAX_SCAN_DEPTH` must stay inside the archive horizon of the
+// configured public RPCs, otherwise the indexer cannot make progress.
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 3000);
+const BOOTSTRAP_DEPTH = Number(process.env.BOOTSTRAP_DEPTH || 2500);
+const SCAN_RETRY_BACKOFF_MS = Number(process.env.SCAN_RETRY_BACKOFF_MS || 15000);
+
+// `--prune-only` turns the process into a one-shot maintenance command so an
+// external scheduler (cron / systemd timer) can enforce the same invariant
+// while the server itself is not running.
+const PRUNE_ONLY = process.argv.includes("--prune-only");
+
 const CHAINS = {
   base: { name: "Base", rpcs: ["https://base-rpc.publicnode.com", "https://mainnet.base.org"], v3Factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", v4PoolManager: "0x498581fF718922c3f8e6A244956aF099B2652b2b" },
   robinhood: { name: "Robinhood", rpcs: ["https://rpc.mainnet.chain.robinhood.com", "https://robinhood-rpc.publicnode.com"], v3Factory: "0x1f7d7550b1b028f7571e69a784071f0205fd2efa", v4PoolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951" },
@@ -44,6 +60,7 @@ CREATE TABLE IF NOT EXISTS pools (
   txHash TEXT,
   createdAt TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_pools_createdAt ON pools(createdAt);
 `);
 try { db.exec("ALTER TABLE pools ADD COLUMN chain TEXT DEFAULT 'base'"); } catch (e) {}
 function metaGet(key) {
@@ -60,7 +77,7 @@ function loadTokenCache() {
   for (const r of rows) tokenCache.set(String(r.address).toLowerCase(), { name: r.name, symbol: r.symbol, decimals: r.decimals });
 }
 loadTokenCache();
-backfillV4State().catch((e) => console.error("backfill err", e.message));
+if (!PRUNE_ONLY) backfillV4State().catch((e) => console.error("backfill err", e.message));
 
 const sseClients = new Set();
 function broadcast(obj) {
@@ -170,7 +187,12 @@ async function fetchTokenMetadata(addrs, rpcs = RPCS) {
 }
 
 function getEnrichedPools() {
-  const rows = db.prepare("SELECT * FROM pools ORDER BY blockNumber DESC, id").all();
+  // Defence in depth: the sweep should already have removed expired rows, but
+  // never serve (or broadcast) anything that is outside the retention window,
+  // even if the sweep is lagging. `createdAt >= ?` also drops legacy rows with
+  // a NULL timestamp, which cannot be proven to be inside the window.
+  const cutoff = new Date(Date.now() - RETENTION_MS).toISOString();
+  const rows = db.prepare("SELECT * FROM pools WHERE createdAt >= ? ORDER BY blockNumber DESC, id").all(cutoff);
   const NATIVE = "0x0000000000000000000000000000000000000000";
   return rows.map((r) => {
     const t0 = tokenCache.get(String(r.token0).toLowerCase()) || (r.token0 === NATIVE ? { name: "Native Ether", symbol: "ETH", decimals: 18 } : null);
@@ -201,25 +223,36 @@ const chainLastScanned = {};
 function getLastScanned(chain) { const v = metaGet("last_scanned_to:" + chain); return v ? Number(v) : 0; }
 function setLastScanned(chain, val) { metaSet("last_scanned_to:" + chain, String(val)); }
 
+// Public RPCs refuse `eth_getLogs` beyond a recent archive horizon (Base's
+// publicnode returns 403 "Archive requests require a personal token" a few
+// thousand blocks back). Scans are therefore clamped to MAX_SCAN_DEPTH so a
+// stale cursor cannot wedge the indexer forever.
+const MAX_SCAN_DEPTH = Number(process.env.MAX_SCAN_DEPTH || 2500);
+const CHUNK_BLOCKS = Number(process.env.SCAN_CHUNK_BLOCKS || 1500);
+
+// Returns { logs, complete }. `complete === false` means at least one chunk
+// failed, so the caller must retry the same range rather than advancing.
 async function fetchLogsRange(address, topic, fromTotal, toTotal, rpcs) {
   const out = [];
-  const total = toTotal - fromTotal + 1;
-  const nchunks = Math.ceil(total / 3000);
+  let complete = true;
+  const nchunks = Math.ceil((toTotal - fromTotal + 1) / CHUNK_BLOCKS);
   for (let i = 0; i < nchunks; i++) {
-    const chunkTo = Math.max(fromTotal, toTotal - i * 3000);
-    const chunkFrom = Math.max(fromTotal, chunkTo - 3000 + 1);
+    const chunkTo = Math.max(fromTotal, toTotal - i * CHUNK_BLOCKS);
+    const chunkFrom = Math.max(fromTotal, chunkTo - CHUNK_BLOCKS + 1);
     if (chunkFrom > chunkTo) break;
     try {
       const res = await rpcCall("eth_getLogs", [
         { fromBlock: "0x" + chunkFrom.toString(16), toBlock: "0x" + chunkTo.toString(16), address, topics: [topic] },
       ], rpcs);
       if (Array.isArray(res)) out.push(...res);
+      else complete = false;
     } catch (e) {
-      console.warn("getLogs err", e.message);
+      complete = false;
+      console.warn(`getLogs ${address} ${chunkFrom}-${chunkTo} err: ${e.message}`);
     }
-    await sleep(100);
+    await sleep(250);
   }
-  return out;
+  return { logs: out, complete };
 }
 
 function pad256Addr(a) { return String(a).slice(2).toLowerCase().padStart(64, "0"); }
@@ -250,9 +283,11 @@ function parseReservesResult(hex) {
 async function processRange(chain, fromBlock, toBlock) {
   const cfg = CHAINS[chain];
   const rpcs = cfg.rpcs;
-  if (fromBlock > toBlock) return 0;
-  const v3logs = await fetchLogsRange(cfg.v3Factory, POOL_EVENT, fromBlock, toBlock, rpcs);
-  const v4logs = await fetchLogsRange(cfg.v4PoolManager, INIT_EVENT_V4, fromBlock, toBlock, rpcs);
+  if (fromBlock > toBlock) return { inserted: 0, complete: true };
+  const v3 = await fetchLogsRange(cfg.v3Factory, POOL_EVENT, fromBlock, toBlock, rpcs);
+  const v4 = await fetchLogsRange(cfg.v4PoolManager, INIT_EVENT_V4, fromBlock, toBlock, rpcs);
+  const v3logs = v3.logs;
+  const v4logs = v4.logs;
   const newPools = [];
   for (const log of v3logs) {
     const token0 = ("0x" + log.topics[1].slice(26)).toLowerCase();
@@ -360,7 +395,7 @@ async function processRange(chain, fromBlock, toBlock) {
     insert.run(p.id, p.chain, p.protocol, p.token0, p.token1, p.fee, p.tickSpacing, p.hooks, p.sqrtPriceX96, p.tick, p.liquidity, p.reserves0, p.reserves1, p.blockNumber, p.txHash, new Date().toISOString());
   }
 
-  return newPools.length;
+  return { inserted: newPools.length, complete: v3.complete && v4.complete };
 }
 
 async function backfillV4State() {
@@ -392,6 +427,39 @@ async function backfillV4State() {
     }
   }
 }
+// ---------------------------------------------------------------------------
+// Retention sweep
+//
+// Deliberately independent of pollLoop: an RPC outage or a scan failure must
+// never be able to disable pruning. Every failure path is swallowed so the
+// timer cannot die, and the sweep also runs unconditionally at boot before the
+// server starts listening.
+// ---------------------------------------------------------------------------
+function prunePools(reason) {
+  try {
+    const cutoff = new Date(Date.now() - RETENTION_MS).toISOString();
+    // `createdAt IS NULL` catches legacy rows written before the column was
+    // populated -- in SQLite `NULL < ?` is NULL, so those rows would otherwise
+    // never match and would live forever.
+    const del = db
+      .prepare("DELETE FROM pools WHERE createdAt IS NULL OR createdAt < ?")
+      .run(cutoff);
+    if (del.changes > 0) {
+      console.log(
+        `[prune:${reason}] removed ${del.changes} pool(s) outside the ${RETENTION_MS / 60000}min window`
+      );
+      broadcast({ type: "snapshot", pools: getEnrichedPools(), deleted: del.changes });
+      return del.changes;
+    }
+  } catch (e) {
+    console.error(`[prune:${reason}] failed:`, e.message);
+  }
+  return 0;
+}
+
+const scanBackoffUntil = {};
+const lastSkipWarn = {};
+
 async function pollLoop() {
   let latestMax = 0;
   try {
@@ -402,27 +470,62 @@ async function pollLoop() {
       if (ls === 0) {
         const latest = await rpcCall("eth_blockNumber", [], rpcs);
         const latestN = Number(latest);
-        ls = Math.max(0, latestN - 5000);
+        ls = Math.max(0, latestN - BOOTSTRAP_DEPTH);
         setLastScanned(chain, ls);
       }
       const latest = await rpcCall("eth_blockNumber", [], rpcs);
       const latestN = Number(latest);
       if (latestN > latestMax) latestMax = latestN;
-      if (latestN > ls) {
-        const n = await processRange(chain, ls + 1, latestN);
-        setLastScanned(chain, latestN);
-        metaSet("last_block", String(latestN));
-        if (n > 0) broadcast({ type: "snapshot", pools: getEnrichedPools(), newCount: n, chain });
+
+      // Clamp: a cursor older than the public archive horizon can never be
+      // scanned (every chunk 403s), which would wedge the chain permanently.
+      // Skip forward to the reachable window and say so loudly -- that range is
+      // genuinely unrecoverable without an archive provider.
+      const horizon = latestN - MAX_SCAN_DEPTH;
+      if (ls < horizon) {
+        if (Date.now() - (lastSkipWarn[chain] || 0) > 60000) {
+          console.warn(
+            `[scan:${chain}] cursor ${ls} is ${latestN - ls} blocks behind head; public RPCs serve ~${MAX_SCAN_DEPTH} blocks. Skipping ${ls} -> ${horizon}.`
+          );
+          lastSkipWarn[chain] = Date.now();
+        }
+        ls = horizon;
+        setLastScanned(chain, ls);
       }
+
+      if (latestN <= ls) continue;
+
+      const n = await processRange(chain, ls + 1, latestN);
+      if (!n.complete) {
+        // Do NOT advance. The same range is retried next tick; the dedupe guard
+        // makes re-processing idempotent.
+        const until = Date.now() + SCAN_RETRY_BACKOFF_MS;
+        if (scanBackoffUntil[chain] !== until) {
+          scanBackoffUntil[chain] = until;
+          console.warn(`[scan:${chain}] range ${ls + 1}-${latestN} incomplete; will retry (cursor held at ${ls}).`);
+        }
+        continue;
+      }
+      setLastScanned(chain, latestN);
+      scanBackoffUntil[chain] = 0;
+      metaSet("last_block", String(latestN));
+      if (n.inserted > 0) broadcast({ type: "snapshot", pools: getEnrichedPools(), newCount: n.inserted, chain });
     }
-    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-    const del = db.prepare("DELETE FROM pools WHERE createdAt < ?").run(cutoff);
-    if (del.changes > 0) broadcast({ type: "snapshot", pools: getEnrichedPools(), deleted: del.changes });
   } catch (e) {
     console.error("poll err", e.message);
   }
-  broadcast({ type: "heartbeat", block: latestMax, time: Date.now() });
-  setTimeout(pollLoop, 3000);
+  // Always reschedule, even if the heartbeat broadcast itself throws -- the loop
+  // must be immortal, it is the discovery engine.
+  try {
+    // Hold off the next tick while a chain is backing off after an incomplete
+    // scan, so a rate-limited RPC is not hammered every 3 seconds.
+    const wait = Math.max(0, ...Object.values(scanBackoffUntil).map((t) => t - Date.now()));
+    broadcast({ type: "heartbeat", block: latestMax, time: Date.now() });
+    setTimeout(pollLoop, Math.max(POLL_INTERVAL_MS, wait || 0));
+  } catch (e) {
+    console.error("heartbeat err", e.message);
+    setTimeout(pollLoop, POLL_INTERVAL_MS);
+  }
 }
 
 
@@ -476,7 +579,43 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on("error", (e) => {
+  console.error("Server error:", e.message);
+  process.exit(1);
+});
+
+// Enforce the retention invariant before the listener opens, so no client can
+// ever observe expired rows -- not even when the previous run was killed
+// mid-boot.
+if (PRUNE_ONLY) {
+  const n = prunePools("cli");
+  console.log(n > 0 ? `Pruned ${n} pool(s)` : "Nothing to prune");
+  try { db.close(); } catch {}
+  process.exit(0);
+}
+
+prunePools("boot");
+const pruneTimer = setInterval(() => prunePools("interval"), PRUNE_INTERVAL_MS);
+if (typeof pruneTimer.unref === "function") pruneTimer.unref();
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[shutdown] ${signal} received -- pruning before exit.`);
+  clearInterval(pruneTimer);
+  prunePools("shutdown");
+  server.close(() => {});
+  try { db.close(); } catch (e) { console.error("[shutdown] db close failed:", e.message); }
+  process.exit(0);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Server listening on " + PORT);
+  console.log(
+    `Retention ${RETENTION_MS / 60000}min -- sweep every ${PRUNE_INTERVAL_MS / 1000}s (independent of the scan loop)`
+  );
   pollLoop();
 });

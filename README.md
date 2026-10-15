@@ -82,6 +82,7 @@ The first launch backfills roughly the **last 5,000 blocks** per chain, then swi
 | `npm start` | `node server.js` | Production entrypoint (same as `api`) |
 | `npm run build` | `vite build` | Bundles the client into `dist/` |
 | `npm run preview` | `vite preview --port 5173` | Serves the production bundle locally |
+| `npm run prune` | `node server.js --prune-only` | One-shot retention sweep, for use from cron / systemd while the server is down |
 
 ### Regenerating styles
 
@@ -122,10 +123,24 @@ The system is a single-process design: **indexer + storage + API + static server
 5. **Resolve tokens** — batched `eth_call`s for `name()` / `symbol()` / `decimals()`, cached in-memory *and* in the `tokens` table.
 6. **Read state** — V3 via `slot0()` / `liquidity()` / `balanceOf()`; V4 via a Reserves lens call whose result is decoded from the 9th 32-byte word.
 7. **Persist** — a single prepared insert per pool, inside one transaction-free loop.
-8. **Prune** — delete rows older than 30 minutes.
-9. **Broadcast** — push a snapshot to all SSE subscribers, then a heartbeat with the current block.
+8. **Broadcast** — push a snapshot to all SSE subscribers, then a heartbeat with the current block.
 
 On startup, a **V4 backfill pass** repairs any V4 pools whose state columns are still `NULL` (for example after an RPC outage during insertion).
+
+### Retention sweep
+
+Pruning is **not** part of the indexing loop. `prunePools()` runs on its own `setInterval` so that an RPC outage, a malformed log, or a scan failure can never disable it — the previous design ran the `DELETE` at the end of the polling `try` block, which meant a single failed RPC call silently stopped all pruning.
+
+| Trigger | Effect |
+| :-- | :-- |
+| **Boot** | Runs unconditionally *before* `server.listen`, so expired rows are never observable by `/api/pools` or the SSE snapshot — even after a hard kill mid-boot. |
+| **Interval** | Every `PRUNE_INTERVAL_MS` (default 30 s), independent of the 3 s scan loop. |
+| **Shutdown** | `SIGINT` / `SIGTERM` prune, `server.close()`, then `db.close()` before exit. |
+| **`npm run prune`** | One-shot `--prune-only` mode for an external scheduler (cron / systemd timer). |
+
+`getEnrichedPools()` additionally filters on `createdAt >= cutoff`, so expired rows are never served even if the sweep is momentarily lagging.
+
+Rows with a `NULL` `createdAt` are deleted on every sweep: in SQLite `NULL < ?` evaluates to `NULL`, so such legacy rows would otherwise never match the predicate and would live forever.
 
 ### Chain registry
 
@@ -137,6 +152,15 @@ Per-chain endpoints and contract addresses live in the `CHAINS` map in `server.j
 | Robinhood | `0x1f7d7550b1b028f7571e69a784071f0205fd2efa` | `0x8366a39cc670b4001a1121b8f6a443a643e40951` | `rpc.mainnet.chain.robinhood.com`, `robinhood-rpc.publicnode.com` |
 
 Every RPC helper iterates the endpoint list and falls through to the next URL on failure, so a single rate-limited or flaky provider degrades gracefully.
+
+### Scan cursor integrity
+
+Public RPCs do **not** serve `eth_getLogs` arbitrarily far back. Base's `publicnode` answers `403 Archive requests require a personal token` a few thousand blocks behind head, and `mainnet.base.org` rate-limits aggressively. Two rules keep the indexer honest under those conditions:
+
+- **The cursor never advances across a failed range.** `fetchLogsRange` reports whether every chunk succeeded; if not, `processRange` returns `complete: false` and the scan cursor is *held*, so the same range is retried instead of being silently skipped. (The dedupe guard makes re-processing idempotent.) An earlier version advanced the cursor unconditionally, which meant any 403 or 429 permanently burned that block range.
+- **The scan is clamped to the archive horizon.** A cursor older than `MAX_SCAN_DEPTH` is unrecoverable — every chunk 403s, so without a clamp the chain wedges forever. The cursor is skipped forward to the reachable window and the gap is logged loudly.
+
+That clamp does mean a gap longer than `MAX_SCAN_DEPTH` (roughly 80 minutes on Base) is lost after a long outage. Covering longer gaps requires a provider with real archive access — set `MAX_SCAN_DEPTH` to match, or point the chain at a paid archive endpoint.
 
 ---
 
@@ -209,6 +233,13 @@ All configuration is environment-based; there is no config file to edit.
 | `API_PORT` | `3000` | Vite | Backend target for the dev proxy when `PORT` is not set |
 | `DB_PATH` | `$STATIC_ROOT/pools.db` | server | SQLite database location |
 | `STATIC_ROOT` | `process.cwd()` | server | Root directory for static file serving |
+| `RETENTION_MS` | `1800000` (30 min) | server, prune | Max lifetime of a pool row before it is swept |
+| `PRUNE_INTERVAL_MS` | `30000` | server | Cadence of the independent retention sweep |
+| `MAX_SCAN_DEPTH` | `2500` | server | How far back a scan may reach; clamped to the RPC archive horizon |
+| `SCAN_CHUNK_BLOCKS` | `1500` | server | `eth_getLogs` window per request |
+| `BOOTSTRAP_DEPTH` | `2500` | server | Initial scan range on a fresh database |
+| `POLL_INTERVAL_MS` | `3000` | server | Head-block check cadence |
+| `SCAN_RETRY_BACKOFF_MS` | `15000` | server | Delay before retrying an incomplete range |
 | `RAILWAY_PUBLIC_DOMAIN` | — | Vite | Enables allowed-host checks and WSS HMR |
 
 ```bash
@@ -223,9 +254,11 @@ Behavioural constants live at the top of `server.js` and are easy to adjust:
 | Constant | Value | Effect |
 | :-- | :-- | :-- |
 | `pollLoop` interval | `3000 ms` | Head-block check cadence |
-| retention cutoff | `30 min` | How long pools stay in the window |
-| bootstrap depth | `5000` blocks | Initial scan range on a fresh database |
-| log chunk size | `3000` blocks | `eth_getLogs` window, with 100 ms between chunks |
+| `PRUNE_INTERVAL_MS` | `30000 ms` | Independent retention sweep cadence |
+| `RETENTION_MS` | `30 min` | How long pools stay in the window |
+| `MAX_SCAN_DEPTH` | `2500` blocks | Furthest-back a scan may reach |
+| `BOOTSTRAP_DEPTH` | `2500` blocks | Initial scan range on a fresh database |
+| log chunk size | `1500` blocks | `eth_getLogs` window, with 250 ms between chunks |
 | token-metadata batch | `60` calls | Batch size + 100 ms delay |
 | V3 state batch | `40` calls | Batch size + 50 ms delay |
 | V4 state batch | `4` calls | Batch size + 200 ms delay |
@@ -325,6 +358,12 @@ npm start        # node server.js
 
 **Why a 30-minute window?** The goal is *discovery*, not history. Pools are pruned 30 minutes after insertion, which keeps SQLite and every snapshot small, keeps the first paint fast, and guarantees the list is dominated by fresh launches.
 
+**Enforcing the window.** The invariant *"no pool row lives longer than `RETENTION_MS`"* holds whenever the process is running, thanks to the boot / interval / shutdown sweeps described above. It **cannot** be enforced while the process is stopped — nothing is running to enforce it. If that matters (long deploys, crash-loops, multi-hour downtime), schedule `npm run prune` externally so the window is restored on the next tick:
+
+```cron
+*/10 * * * * cd /srv/app && DB_PATH=/data/pools.db /usr/bin/node server.js --prune-only
+```
+
 **Precision.** `uint256` values are stored and transported as strings. Any conversion to `Number` happens only at render time, for display.
 
 **Known gaps.**
@@ -333,6 +372,9 @@ npm start        # node server.js
 - `/api/pools` returns the entire window as one payload; this is fine at current volumes but would want pagination for a longer retention period.
 - The V4 Reserves lens address is a module-level constant. Adding a chain whose lens is deployed elsewhere requires parameterising it per chain.
 - There is no authentication, rate limiting, or TLS termination — all three are expected to be handled by the hosting platform or a reverse proxy.
+- The `tokens` metadata cache is intentionally never pruned (it is address-keyed, not time-keyed) and grows without bound; it would need its own retention policy at some point.
+- Scan gaps longer than `MAX_SCAN_DEPTH` (~80 min on Base) are unrecoverable on free public RPCs — see [Scan cursor integrity](#scan-cursor-integrity).
+- SQLite deletions do not shrink the file. `pools.db` will stay at its high-water size even when nearly empty; run `VACUUM` during a maintenance window if that matters.
 
 ---
 
